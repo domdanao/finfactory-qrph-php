@@ -1,0 +1,147 @@
+<?php
+
+declare(strict_types=1);
+
+namespace FinFactory\QrPh;
+
+use chillerlan\QRCode\Common\EccLevel;
+use chillerlan\QRCode\QRCode;
+use chillerlan\QRCode\QROptions;
+
+/**
+ * Draws a QR Ph code as SVG, with the QR Ph logo in the centre:
+ *
+ *   $logo = ['data' => file_get_contents(__DIR__ . '/qrph-logo.png'), 'type' => 'image/png'];
+ *   echo QrPh::svg($payload, ['logo' => $logo]);
+ *
+ * Works with any QR Ph payload: from FinFactory, or from any other provider that gives you the
+ * payload text. Needs no API key and makes no network calls.
+ *
+ * Options:
+ * - `logo`: the QR Ph logo, drawn in the middle. Merchant (P2M) QR Ph codes carry it there, per
+ *   the BSP's QR Ph rebranding. Either a URL or `data:` URI, used as the image's `href` as it is,
+ *   or ['data' => bytes, 'type' => 'image/png'], embedded as a `data:` URI. This package doesn't
+ *   ship the logo: it's the BSP's mark, not ours to license.
+ * - `margin`: light border around the code, in modules. Default 4, what the QR standard asks for.
+ * - `foreground`, `background`: colours. Default `#000` on `#fff`; keep it dark on light.
+ * - `title`: accessible name of the image. Default "QR Ph code".
+ *
+ * Without a logo the code is drawn whole. Error correction is level H either way, so scanners
+ * read the code past the logo. The SVG scales; show it at 250px or more across.
+ */
+final class QrPh
+{
+    public const VERSION = '0.1.0';
+
+    /**
+     * The QR Ph code as an <svg> element. Pass the QR payload, or a FinFactory payment intent: an
+     * object or array with next_action.qrph_display_qr_code.data (null is returned when it isn't
+     * waiting for a QR Ph payment). No dependency on the FinFactory SDK.
+     *
+     * @param string|object|array<string, mixed> $source
+     * @param array{logo?: string|array{data: string, type: string}, margin?: int, foreground?: string, background?: string, title?: string} $options
+     */
+    public static function svg(string|object|array $source, array $options = []): ?string
+    {
+        $data = \is_string($source) ? $source : self::payloadOf($source);
+        if ($data === null) {
+            return null;
+        }
+        if ($data === '') {
+            throw new \InvalidArgumentException('finfactory-qrph: QrPh::svg needs a QR payload; got an empty string.');
+        }
+        $margin = $options['margin'] ?? 4;
+        if (!\is_int($margin) || $margin < 0) {
+            throw new \InvalidArgumentException("finfactory-qrph: QrPh::svg's margin must be a whole number of modules, 0 or more.");
+        }
+
+        $qr = new QRCode(new QROptions(['eccLevel' => EccLevel::H, 'addQuietzone' => false]));
+        $qr->addByteSegment($data);
+        $matrix = $qr->getQRMatrix();
+        $n = $matrix->getSize();
+
+        $href = self::logoHref($options);
+        $hole = $href === null ? 0 : self::logoModules($n);
+        $from = intdiv($n - $hole, 2);
+        $to = $from + $hole;
+        $inHole = static fn (int $x, int $y): bool => $y >= $from && $y < $to && $x >= $from && $x < $to;
+
+        // One path; each row's runs of dark modules become one rectangle each.
+        $d = '';
+        for ($y = 0; $y < $n; $y++) {
+            for ($x = 0; $x < $n;) {
+                if (!$matrix->check($x, $y) || $inHole($x, $y)) {
+                    $x++;
+                    continue;
+                }
+                $start = $x;
+                while ($x < $n && $matrix->check($x, $y) && !$inHole($x, $y)) {
+                    $x++;
+                }
+                $run = $x - $start;
+                $d .= 'M' . ($start + $margin) . ' ' . ($y + $margin) . "h{$run}v1h-{$run}z";
+            }
+        }
+
+        $size = $n + 2 * $margin;
+        $image = $href === null
+            ? ''
+            // One module inside the cleared square, leaving a light border around the logo.
+            : \sprintf('<image x="%1$d" y="%1$d" width="%2$d" height="%2$d" href="%3$s"/>', $from + $margin + 1, $hole - 2, self::attr($href));
+        $title = self::attr($options['title'] ?? 'QR Ph code');
+
+        return "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 {$size} {$size}\" shape-rendering=\"crispEdges\" role=\"img\" aria-label=\"{$title}\">"
+            . "<title>{$title}</title>"
+            . "<rect width=\"{$size}\" height=\"{$size}\" fill=\"" . self::attr($options['background'] ?? '#fff') . '"/>'
+            . "<path d=\"{$d}\" fill=\"" . self::attr($options['foreground'] ?? '#000') . '"/>'
+            . $image
+            . '</svg>';
+    }
+
+    /** Side of the cleared middle square, in modules: about a quarter of the code, odd so it centers. */
+    public static function logoModules(int $moduleCount): int
+    {
+        $side = max(7, (int) round($moduleCount * 0.25));
+        return $side % 2 === 1 ? $side : $side - 1;
+    }
+
+    /** Reads next_action.qrph_display_qr_code.data from a payment intent, as an object or an array. */
+    private static function payloadOf(object|array $intent): ?string
+    {
+        $get = static fn (mixed $from, string $key): mixed => match (true) {
+            \is_array($from) || $from instanceof \ArrayAccess => $from[$key] ?? null,
+            \is_object($from) => $from->{$key} ?? null,
+            default => null,
+        };
+        $action = $get($intent, 'next_action');
+        if ($get($action, 'type') !== 'qrph_display_qr_code') {
+            return null;
+        }
+        $data = $get($get($action, 'qrph_display_qr_code'), 'data');
+        return \is_string($data) ? $data : null;
+    }
+
+    /** @param array<string, mixed> $options */
+    private static function logoHref(array $options): ?string
+    {
+        if (!isset($options['logo'])) {
+            return null;
+        }
+        $logo = $options['logo'];
+        if (\is_string($logo)) {
+            if ($logo === '') {
+                throw new \InvalidArgumentException("finfactory-qrph: QrPh::svg's logo is an empty string.");
+            }
+            return $logo;
+        }
+        if (\is_array($logo) && \is_string($logo['data'] ?? null) && \is_string($logo['type'] ?? null) && $logo['data'] !== '') {
+            return "data:{$logo['type']};base64," . base64_encode($logo['data']);
+        }
+        throw new \InvalidArgumentException("finfactory-qrph: QrPh::svg's logo must be a URL, a data: URI, or ['data' => bytes, 'type' => 'image/png'].");
+    }
+
+    private static function attr(string $s): string
+    {
+        return htmlspecialchars($s, ENT_QUOTES | ENT_XML1, 'UTF-8');
+    }
+}
